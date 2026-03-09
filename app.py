@@ -29,31 +29,61 @@ def parse_vat(raw: str):
 # ── VIES Query ────────────────────────────────────────────────────────────────
 
 def check_vies(country_code: str, vat_number: str) -> dict:
-    from zeep import Client
-    from zeep.exceptions import Fault
+    import requests as req
+    import xml.etree.ElementTree as ET
 
-    wsdl = "https://ec.europa.eu/taxation_customs/vies/checkVatService.wsdl"
-    client = Client(wsdl)
+    envelope = f"""<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
+  <soapenv:Body>
+    <urn:checkVat>
+      <urn:countryCode>{country_code}</urn:countryCode>
+      <urn:vatNumber>{vat_number}</urn:vatNumber>
+    </urn:checkVat>
+  </soapenv:Body>
+</soapenv:Envelope>"""
 
+    base = {"country_code": country_code, "vat_number": vat_number,
+            "name": "—", "address": "—",
+            "request_date": str(datetime.date.today())}
     try:
-        result = client.service.checkVat(
-            countryCode=country_code,
-            vatNumber=vat_number
+        response = req.post(
+            "https://ec.europa.eu/taxation_customs/vies/services/checkVatService",
+            data=envelope,
+            headers={"Content-Type": "text/xml; charset=UTF-8"},
+            timeout=10
         )
+        ns = {"ns": "urn:ec.europa.eu:taxud:vies:services:checkVat:types"}
+        root = ET.fromstring(response.text)
+
+        # Check for fault
+        fault = root.find(".//{http://schemas.xmlsoap.org/soap/envelope/}Fault")
+        if fault is not None:
+            faultstring = fault.findtext("faultstring", "").upper()
+            if "INVALID" in faultstring:
+                return {**base, "status": "INVALID"}
+            return {**base, "status": "UNAVAILABLE"}
+
+        valid_el = root.find(".//ns:valid", ns)
+        if valid_el is None:
+            return {**base, "status": "UNAVAILABLE"}
+
+        valid = valid_el.text.strip().lower() == "true"
+        name = (root.findtext(".//ns:name", "—", ns) or "—").strip()
+        address = (root.findtext(".//ns:address", "—", ns) or "—").strip().replace("\n", ", ")
+        req_date = root.findtext(".//ns:requestDate", str(datetime.date.today()), ns)
+
         return {
-            "status":       "VALID" if result.valid else "INVALID",
-            "country_code": result.countryCode,
-            "vat_number":   result.vatNumber,
-            "name":         result.name or "—",
-            "address":      (result.address or "—").replace("\n", ", "),
-            "request_date": str(result.requestDate),
+            "status":       "VALID" if valid else "INVALID",
+            "country_code": country_code,
+            "vat_number":   vat_number,
+            "name":         name,
+            "address":      address,
+            "request_date": str(req_date),
         }
     except Exception as e:
         err = str(e).upper()
-        base = {"country_code": country_code, "vat_number": vat_number,
-                "name": "—", "address": "—",
-                "request_date": str(datetime.date.today())}
-        if "INVALID_INPUT" in err:
+        if "INVALID" in err:
             return {**base, "status": "INVALID"}
         return {**base, "status": "UNAVAILABLE"}
 
