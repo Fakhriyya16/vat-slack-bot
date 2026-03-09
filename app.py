@@ -185,7 +185,7 @@ def process_vat(response_url: str, channel_id: str, vat_raw: str):
 
     # Post "checking..." message immediately
     requests.post(response_url, json={
-        "text": f"🔍 Checking `{vat_raw}` against EU VIES..."
+        "text": f"🔍 Checking {vat_raw} against EU VIES..."
     })
 
     try:
@@ -207,7 +207,7 @@ def process_vat(response_url: str, channel_id: str, vat_raw: str):
         {
             "type": "section",
             "fields": [
-                {"type": "mrkdwn", "text": f"*VAT Number*\n`{country_code}{vat_number}`"},
+                {"type": "mrkdwn", "text": f"*VAT Number*\n{country_code}{vat_number}"},
                 {"type": "mrkdwn", "text": f"*Status*\n{status}"},
                 {"type": "mrkdwn", "text": f"*Company Name*\n{data['name']}"},
                 {"type": "mrkdwn", "text": f"*Address*\n{data['address']}"},
