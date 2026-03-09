@@ -2,19 +2,21 @@
 VAT Checker Slack Bot
 ---------------------
 Slack slash command: /vat SE663000013801
-Returns VALID/INVALID/UNAVAILABLE + uploads a PDF proof.
+Returns VALID/INVALID/UNAVAILABLE + uploads PDF to Slack and Google Drive.
 """
 
 import os
 import io
+import json
 import datetime
 import threading
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 
 app = Flask(__name__)
 slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+
+DRIVE_FOLDER_ID = "169XfIlnQfIg8ocQmeTkKeo9GKJrw-g-b"
 
 
 # ── VAT Parsing ───────────────────────────────────────────────────────────────
@@ -32,16 +34,15 @@ def check_vies(country_code: str, vat_number: str) -> dict:
     import requests as req
     import xml.etree.ElementTree as ET
 
-    envelope = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-                  xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
-  <soapenv:Body>
-    <urn:checkVat>
-      <urn:countryCode>{country_code}</urn:countryCode>
-      <urn:vatNumber>{vat_number}</urn:vatNumber>
-    </urn:checkVat>
-  </soapenv:Body>
-</soapenv:Envelope>"""
+    envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"'
+        ' xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">'
+        "<soapenv:Body><urn:checkVat>"
+        f"<urn:countryCode>{country_code}</urn:countryCode>"
+        f"<urn:vatNumber>{vat_number}</urn:vatNumber>"
+        "</urn:checkVat></soapenv:Body></soapenv:Envelope>"
+    )
 
     base = {"country_code": country_code, "vat_number": vat_number,
             "corrected_vat": None, "name": "—", "address": "—",
@@ -72,7 +73,6 @@ def check_vies(country_code: str, vat_number: str) -> dict:
         address = (root.findtext(".//ns:address", "—", ns) or "—").strip().replace("\n", ", ")
         req_date = root.findtext(".//ns:requestDate", str(datetime.date.today()), ns)
 
-        # Detect if VIES corrected the VAT number
         returned_vat = (root.findtext(".//ns:vatNumber", vat_number, ns) or vat_number).strip()
         corrected_vat = returned_vat if returned_vat != vat_number.strip() else None
 
@@ -112,7 +112,6 @@ def generate_pdf_bytes(data: dict) -> bytes:
     status = data["status"]
     r, g, b = STATUS_COLORS.get(status, (0.3, 0.3, 0.3))
 
-    # Header
     c.setFillColorRGB(0.10, 0.14, 0.24)
     c.rect(0, H - 55*mm, W, 55*mm, fill=1, stroke=0)
     c.setFillColorRGB(1, 1, 1)
@@ -123,7 +122,6 @@ def generate_pdf_bytes(data: dict) -> bytes:
     c.drawString(20*mm, H - 48*mm,
         f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Status badge
     badge_y = H - 80*mm
     c.setFillColorRGB(r, g, b)
     c.roundRect(20*mm, badge_y, 60*mm, 16*mm, 4*mm, fill=1, stroke=0)
@@ -131,7 +129,6 @@ def generate_pdf_bytes(data: dict) -> bytes:
     c.setFont("Helvetica-Bold", 16)
     c.drawCentredString(50*mm, badge_y + 5*mm, status)
 
-    # Details — include corrected VAT if present
     fields = [("Original VAT", f"{data['country_code']}{data['vat_number']}")]
     if data.get("corrected_vat"):
         fields.append(("Corrected VAT", f"{data['country_code']}{data['corrected_vat']}"))
@@ -155,14 +152,13 @@ def generate_pdf_bytes(data: dict) -> bytes:
         c.setFont("Helvetica-Bold", 10)
         c.drawString(col1 + 3*mm, y + 5*mm, label)
         if label == "Corrected VAT":
-            c.setFillColorRGB(0.90, 0.55, 0.00)  # amber highlight
+            c.setFillColorRGB(0.90, 0.55, 0.00)
         else:
             c.setFillColorRGB(0.10, 0.10, 0.10)
         c.setFont("Helvetica", 10)
         c.drawString(col2, y + 5*mm, str(value)[:80])
         y -= row_h
 
-    # Footer
     c.setFillColorRGB(0.10, 0.14, 0.24)
     c.rect(0, 0, W, 18*mm, fill=1, stroke=0)
     c.setFillColorRGB(0.7, 0.7, 0.7)
@@ -176,7 +172,80 @@ def generate_pdf_bytes(data: dict) -> bytes:
     return buf.read()
 
 
-# ── Slack Response (runs in background thread) ────────────────────────────────
+# ── Google Drive Upload ───────────────────────────────────────────────────────
+
+def get_drive_service():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    secret_path = "/etc/secrets/google_credentials.json"
+    if os.path.exists(secret_path):
+        with open(secret_path) as f:
+            creds_dict = json.load(f)
+    else:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        if not creds_json:
+            raise ValueError("Google credentials not found")
+        creds_dict = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds)
+
+
+def find_or_create_customer_folder(service, company_name: str) -> str:
+    """Find existing customer folder or create one under the customer documents folder."""
+    # Sanitise company name for folder matching
+    safe_name = company_name.strip()
+
+    # Search for existing folder with this name inside customer documents
+    query = (
+        f"name = '{safe_name}' "
+        f"and '{DRIVE_FOLDER_ID}' in parents "
+        f"and mimeType = 'application/vnd.google-apps.folder' "
+        f"and trashed = false"
+    )
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+
+    if files:
+        return files[0]["id"]
+
+    # Create new folder for this customer
+    folder_metadata = {
+        "name": safe_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    folder = service.files().create(body=folder_metadata, fields="id").execute()
+    return folder["id"]
+
+
+def upload_to_drive(pdf_bytes: bytes, filename: str, company_name: str) -> str:
+    from googleapiclient.http import MediaIoBaseUpload
+
+    service = get_drive_service()
+
+    # Use company name as folder, fall back to _unmatched if name is missing
+    folder_name = company_name if company_name and company_name != "—" else "_unmatched"
+    folder_id = find_or_create_customer_folder(service, folder_name)
+
+    file_metadata = {
+        "name": filename,
+        "parents": [folder_id],
+    }
+    media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf")
+    uploaded = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink"
+    ).execute()
+
+    return uploaded.get("webViewLink", "")
+
+
+# ── Slack Response ────────────────────────────────────────────────────────────
 
 STATUS_EMOJI = {"VALID": "✅", "INVALID": "❌", "UNAVAILABLE": "⚠️"}
 
@@ -216,14 +285,19 @@ def process_vat(response_url: str, channel_id: str, vat_raw: str):
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"{emoji} VAT Check Result: {status}"}},
         {"type": "section", "fields": fields},
-        {"type": "divider"}
+        {"type": "divider"},
     ]
     requests.post(response_url, json={"blocks": blocks, "response_type": "in_channel"})
-    if data["status"] != "VALID":
+
+    # Only generate and upload PDF for VALID results
+    if status != "VALID":
         return
+
     try:
         pdf_bytes = generate_pdf_bytes(data)
         filename = f"VAT_{country_code}{vat_number}_{datetime.date.today()}.pdf"
+
+        # Upload to Slack
         slack_client.files_upload_v2(
             channel=channel_id,
             filename=filename,
@@ -231,6 +305,18 @@ def process_vat(response_url: str, channel_id: str, vat_raw: str):
             title=f"VAT Verification — {country_code}{vat_number}",
             initial_comment=f"📄 PDF proof for {country_code}{vat_number}"
         )
+
+        # Upload to Google Drive
+        try:
+            drive_link = upload_to_drive(pdf_bytes, filename, data["name"])
+            if drive_link:
+                requests.post(response_url, json={
+                    "response_type": "in_channel",
+                    "text": f"📁 Saved to Google Drive: {drive_link}"
+                })
+        except Exception as e:
+            requests.post(response_url, json={"text": f"⚠️ Drive upload failed: {e}"})
+
     except Exception as e:
         requests.post(response_url, json={"text": f"⚠️ PDF upload failed: {e}"})
 
@@ -255,7 +341,6 @@ def slack_vat():
         })
 
     threading.Thread(target=process_vat, args=(response_url, channel_id, vat_raw)).start()
-
     return jsonify({"response_type": "ephemeral", "text": f"⏳ Looking up {vat_raw}..."})
 
 
