@@ -219,7 +219,8 @@ def process_vat(response_url: str, channel_id: str, vat_raw: str):
         {"type": "divider"}
     ]
     requests.post(response_url, json={"blocks": blocks, "response_type": "in_channel"})
-
+    if data["status"] != "VALID":
+        return
     try:
         pdf_bytes = generate_pdf_bytes(data)
         filename = f"VAT_{country_code}{vat_number}_{datetime.date.today()}.pdf"
