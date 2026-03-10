@@ -3,3 +3,6 @@ slack-sdk==3.27.1
 reportlab==4.2.0
 requests==2.32.3
 gunicorn==22.0.0
+google-auth==2.29.0
+google-api-python-client==2.125.0
+google-auth-httplib2==0.2.0
