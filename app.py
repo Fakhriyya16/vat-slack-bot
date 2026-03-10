@@ -1,5 +1,5 @@
 """
-VAT Checker Slack Bot with Google Drive (Shared Drive) support
+VAT Checker Slack Bot — with interactive folder selection buttons
 """
 
 import os
@@ -14,6 +14,12 @@ app = Flask(__name__)
 slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
 DRIVE_FOLDER_ID = "169XfIlnQfIg8ocQmeTkKeo9GKJrw-g-b"
 
+# Temporary store for pending folder selections
+# key: action_id, value: {pdf_bytes, filename, company_name, candidates}
+pending_uploads = {}
+
+
+# ── VAT Parsing ───────────────────────────────────────────────────────────────
 
 def parse_vat(raw):
     raw = raw.strip().upper().replace(" ", "").replace("-", "")
@@ -21,6 +27,8 @@ def parse_vat(raw):
         raise ValueError("VAT number too short.")
     return raw[:2], raw[2:]
 
+
+# ── VIES Query ────────────────────────────────────────────────────────────────
 
 def check_vies(country_code, vat_number):
     import requests as req
@@ -71,6 +79,8 @@ def check_vies(country_code, vat_number):
     except Exception as e:
         return {**base, "status": "INVALID" if "INVALID" in str(e).upper() else "UNAVAILABLE"}
 
+
+# ── PDF Generation ────────────────────────────────────────────────────────────
 
 STATUS_COLORS = {
     "VALID": (0.07, 0.53, 0.32),
@@ -127,7 +137,6 @@ def generate_pdf_bytes(data):
         c.setFillColorRGB(0.40, 0.40, 0.40)
         c.setFont("Helvetica-Bold", 10)
         c.drawString(col1 + 3*mm, y + 5*mm, label)
-        c.setFillColorRGB(0.90, 0.55, 0.00 if label == "Corrected VAT" else 0.00)
         c.setFillColorRGB(*(0.90, 0.55, 0.00) if label == "Corrected VAT" else (0.10, 0.10, 0.10))
         c.setFont("Helvetica", 10)
         c.drawString(col2, y + 5*mm, str(value)[:80])
@@ -144,6 +153,8 @@ def generate_pdf_bytes(data):
     buf.seek(0)
     return buf.read()
 
+
+# ── Google Drive ──────────────────────────────────────────────────────────────
 
 def get_drive_service():
     from google.oauth2 import service_account
@@ -165,34 +176,81 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def find_or_create_customer_folder(service, company_name):
-    safe_name = company_name.strip()
+def get_all_customer_folders(service):
+    """Fetch all subfolders inside the customer documents folder."""
     query = (
-        f"name = '{safe_name}' and '{DRIVE_FOLDER_ID}' in parents "
+        f"'{DRIVE_FOLDER_ID}' in parents "
         f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     )
     results = service.files().list(
         q=query, fields="files(id, name)",
-        supportsAllDrives=True, includeItemsFromAllDrives=True
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+        pageSize=500
     ).execute()
-    files = results.get("files", [])
-    if files:
-        return files[0]["id"]
-
-    folder = service.files().create(
-        body={"name": safe_name, "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_FOLDER_ID]},
-        fields="id", supportsAllDrives=True
-    ).execute()
-    return folder["id"]
+    return results.get("files", [])
 
 
-def upload_to_drive(pdf_bytes, filename, company_name):
+LEGAL_SUFFIXES = {
+    "sa", "nv", "bv", "ab", "ag", "ltd", "llc", "inc", "gmbh", "srl",
+    "sas", "spa", "oy", "as", "plc", "pte", "pty", "kft", "zrt",
+    "momsgrupp", "holding", "group", "groep", "international", "intl", "bank"
+}
+
+def clean_name(name):
+    words = name.lower().replace("-", " ").replace("_", " ").split()
+    return [w for w in words if w not in LEGAL_SUFFIXES and len(w) > 2]
+
+
+def score_match(company_name, folder_name):
+    """
+    Returns a match score between 0 and 1.
+    1.0 = exact match, 0 = no meaningful overlap.
+    """
+    company_words = clean_name(company_name)
+    folder_words = clean_name(folder_name)
+
+    if not folder_words or not company_words:
+        return 0.0
+
+    matches = sum(
+        1 for fw in folder_words
+        if any(fw == cw or (len(fw) > 3 and (fw in cw or cw in fw))
+               for cw in company_words)
+    )
+    return matches / len(folder_words)
+
+
+def find_folder_candidates(all_folders, company_name):
+    """
+    Returns:
+    - exact: single folder dict if exact name match
+    - candidates: list of folder dicts with score >= 0.6 (fuzzy matches)
+    - none: empty list (no matches)
+    """
+    # Exact match
+    for folder in all_folders:
+        if folder["name"].strip().lower() == company_name.strip().lower():
+            return "exact", [folder]
+
+    # Fuzzy candidates — score >= 0.6
+    scored = [
+        (score_match(company_name, f["name"]), f)
+        for f in all_folders
+    ]
+    candidates = [f for score, f in scored if score >= 0.6]
+    candidates.sort(key=lambda f: score_match(company_name, f["name"]), reverse=True)
+
+    if len(candidates) == 1:
+        return "single_fuzzy", candidates
+    elif len(candidates) > 1:
+        return "ambiguous", candidates
+    else:
+        return "none", []
+
+
+def upload_pdf_to_folder(pdf_bytes, filename, folder_id):
     from googleapiclient.http import MediaIoBaseUpload
-
     service = get_drive_service()
-    folder_name = company_name if company_name and company_name != "—" else "_unmatched"
-    folder_id = find_or_create_customer_folder(service, folder_name)
-
     media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf")
     uploaded = service.files().create(
         body={"name": filename, "parents": [folder_id]},
@@ -203,7 +261,95 @@ def upload_to_drive(pdf_bytes, filename, company_name):
     return uploaded.get("webViewLink", "")
 
 
+def create_customer_folder(company_name):
+    service = get_drive_service()
+    folder = service.files().create(
+        body={"name": company_name.strip(), "mimeType": "application/vnd.google-apps.folder", "parents": [DRIVE_FOLDER_ID]},
+        fields="id", supportsAllDrives=True
+    ).execute()
+    return folder["id"]
+
+
+# ── Slack Helpers ─────────────────────────────────────────────────────────────
+
 STATUS_EMOJI = {"VALID": "✅", "INVALID": "❌", "UNAVAILABLE": "⚠️"}
+
+
+def post_to_slack_and_drive(channel_id, response_url, pdf_bytes, filename, company_name, folder_id):
+    """Upload PDF to Slack and Drive after folder is determined."""
+    import requests
+
+    # Upload to Slack
+    slack_client.files_upload_v2(
+        channel=channel_id,
+        filename=filename,
+        content=pdf_bytes,
+        title=f"VAT Verification — {filename}",
+        initial_comment=f"📄 PDF proof for {filename.replace('.pdf','')}"
+    )
+
+    # Upload to Drive
+    try:
+        drive_link = upload_pdf_to_folder(pdf_bytes, filename, folder_id)
+        if drive_link:
+            slack_client.chat_postMessage(
+                channel=channel_id,
+                text=f"📁 Saved to Google Drive: {drive_link}"
+            )
+    except Exception as e:
+        slack_client.chat_postMessage(
+            channel=channel_id,
+            text=f"⚠️ Drive upload failed: {e}"
+        )
+
+
+def ask_user_to_pick_folder(channel_id, response_url, pdf_bytes, filename, company_name, candidates):
+    """Post an interactive message asking user to pick the right folder."""
+    import uuid
+
+    pending_id = str(uuid.uuid4())[:8]
+    pending_uploads[pending_id] = {
+        "pdf_bytes": pdf_bytes,
+        "filename": filename,
+        "company_name": company_name,
+        "channel_id": channel_id,
+        "candidates": {f["id"]: f["name"] for f in candidates},
+    }
+
+    buttons = []
+    for folder in candidates[:4]:  # Max 4 buttons
+        buttons.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": folder["name"]},
+            "value": json.dumps({"pending_id": pending_id, "folder_id": folder["id"]}),
+            "action_id": f"folder_{folder['id'][:8]}"
+        })
+
+    # Add "Create new folder" button
+    buttons.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": f"➕ Create new: {company_name[:30]}"},
+        "value": json.dumps({"pending_id": pending_id, "folder_id": "NEW"}),
+        "action_id": "folder_new",
+        "style": "primary"
+    })
+
+    slack_client.chat_postMessage(
+        channel=channel_id,
+        blocks=[
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"⚠️ *Multiple folders found for `{company_name}`*\nWhich folder should I save the PDF to?"}
+            },
+            {
+                "type": "actions",
+                "elements": buttons
+            }
+        ]
+    )
+
+
+# ── Main VAT processing ───────────────────────────────────────────────────────
 
 def process_vat(response_url, channel_id, vat_raw):
     import requests
@@ -251,26 +397,59 @@ def process_vat(response_url, channel_id, vat_raw):
     try:
         pdf_bytes = generate_pdf_bytes(data)
         filename = f"VAT_{country_code}{vat_number}_{datetime.date.today()}.pdf"
+        company_name = data["name"] if data["name"] != "—" else "_unmatched"
 
-        slack_client.files_upload_v2(
-            channel=channel_id, filename=filename, content=pdf_bytes,
-            title=f"VAT Verification — {country_code}{vat_number}",
-            initial_comment=f"📄 PDF proof for {country_code}{vat_number}"
-        )
-
+        # Find folder candidates
         try:
-            drive_link = upload_to_drive(pdf_bytes, filename, data["name"])
-            if drive_link:
-                requests.post(response_url, json={
-                    "response_type": "in_channel",
-                    "text": f"📁 Saved to Google Drive: {drive_link}"
-                })
+            service = get_drive_service()
+            all_folders = get_all_customer_folders(service)
+            match_type, candidates = find_folder_candidates(all_folders, company_name)
+
+            if match_type in ("exact", "single_fuzzy"):
+                # Single clear match — upload automatically
+                folder_id = candidates[0]["id"]
+                folder_name = candidates[0]["name"]
+                post_to_slack_and_drive(channel_id, response_url, pdf_bytes, filename, company_name, folder_id)
+                slack_client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"✅ PDF saved to folder: *{folder_name}*"
+                )
+
+            elif match_type == "ambiguous":
+                # Multiple matches — ask user to pick
+                # First upload PDF to Slack so they can see it while deciding
+                slack_client.files_upload_v2(
+                    channel=channel_id,
+                    filename=filename,
+                    content=pdf_bytes,
+                    title=f"VAT Verification — {filename}",
+                    initial_comment=f"📄 PDF proof for {filename.replace('.pdf','')}"
+                )
+                ask_user_to_pick_folder(channel_id, response_url, pdf_bytes, filename, company_name, candidates)
+
+            else:
+                # No match — create new folder and upload
+                folder_id = create_customer_folder(company_name)
+                post_to_slack_and_drive(channel_id, response_url, pdf_bytes, filename, company_name, folder_id)
+                slack_client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"📁 New folder created and PDF saved: *{company_name}*"
+                )
+
         except Exception as e:
-            requests.post(response_url, json={"text": f"⚠️ Drive upload failed: {e}"})
+            # Drive failed — still upload to Slack
+            slack_client.files_upload_v2(
+                channel=channel_id, filename=filename, content=pdf_bytes,
+                title=f"VAT Verification — {filename}",
+                initial_comment=f"📄 PDF proof for {filename.replace('.pdf','')}"
+            )
+            slack_client.chat_postMessage(channel=channel_id, text=f"⚠️ Drive upload failed: {e}")
 
     except Exception as e:
-        requests.post(response_url, json={"text": f"⚠️ PDF upload failed: {e}"})
+        requests.post(response_url, json={"text": f"⚠️ PDF generation failed: {e}"})
 
+
+# ── Flask Routes ──────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -291,6 +470,45 @@ def slack_vat():
 
     threading.Thread(target=process_vat, args=(response_url, channel_id, vat_raw)).start()
     return jsonify({"response_type": "ephemeral", "text": f"⏳ Looking up {vat_raw}..."})
+
+
+@app.route("/slack/actions", methods=["POST"])
+def slack_actions():
+    """Handle interactive button clicks for folder selection."""
+    payload = json.loads(request.form.get("payload", "{}"))
+    actions = payload.get("actions", [])
+    channel_id = payload.get("channel", {}).get("id")
+
+    for action in actions:
+        value = json.loads(action.get("value", "{}"))
+        pending_id = value.get("pending_id")
+        folder_id = value.get("folder_id")
+
+        upload_data = pending_uploads.pop(pending_id, None)
+        if not upload_data:
+            slack_client.chat_postMessage(channel=channel_id, text="⚠️ Session expired. Please run the /vat check again.")
+            return jsonify({})
+
+        pdf_bytes = upload_data["pdf_bytes"]
+        filename = upload_data["filename"]
+        company_name = upload_data["company_name"]
+
+        if folder_id == "NEW":
+            folder_id = create_customer_folder(company_name)
+            folder_name = company_name
+        else:
+            folder_name = upload_data["candidates"].get(folder_id, "selected folder")
+
+        try:
+            drive_link = upload_pdf_to_folder(pdf_bytes, filename, folder_id)
+            slack_client.chat_postMessage(
+                channel=channel_id,
+                text=f"✅ PDF saved to folder *{folder_name}*\n📁 {drive_link}"
+            )
+        except Exception as e:
+            slack_client.chat_postMessage(channel=channel_id, text=f"⚠️ Drive upload failed: {e}")
+
+    return jsonify({})
 
 
 if __name__ == "__main__":
