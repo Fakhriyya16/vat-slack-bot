@@ -333,8 +333,10 @@ def upload_to_both_drives(pdf_bytes, filename, company_name):
         client_folder2_id = create_customer_folder(service, DRIVE_FOLDER_ID_2, company_name)
         folder2_name = company_name
 
-    # Find or create "Vies Check" subfolder inside client folder
-    vies_check_folder_id = find_or_create_subfolder(service, client_folder2_id, VIES_CHECK_SUBFOLDER)
+    # Find or create "Finance" subfolder inside client folder
+    finance_folder_id = find_or_create_subfolder(service, client_folder2_id, "Finance")
+    # Find or create "Vies Check" subfolder inside Finance folder
+    vies_check_folder_id = find_or_create_subfolder(service, finance_folder_id, VIES_CHECK_SUBFOLDER)
     folder2_link = upload_pdf_to_folder(service, pdf_bytes, filename, vies_check_folder_id)
 
     return folder1_link, folder2_link, folder1_name, folder2_name, [], []
@@ -553,7 +555,10 @@ def slack_actions():
                 client_folder2_id = create_customer_folder(service, DRIVE_FOLDER_ID_2, company_name)
                 folder2_name = company_name
 
-            vies_check_folder_id = find_or_create_subfolder(service, client_folder2_id, VIES_CHECK_SUBFOLDER)
+            # Find or create "Finance" subfolder inside client folder
+            finance_folder_id = find_or_create_subfolder(service, client_folder2_id, "Finance")
+            # Find or create "Vies Check" subfolder inside Finance folder
+            vies_check_folder_id = find_or_create_subfolder(service, finance_folder_id, VIES_CHECK_SUBFOLDER)
             folder2_link = upload_pdf_to_folder(service, pdf_bytes, filename, vies_check_folder_id)
 
             post_drive_confirmation(channel_id, folder1_link, folder2_link, folder1_name, folder2_name)
