@@ -1,6 +1,5 @@
 """
-VAT Checker Slack Bot — with interactive folder selection, dual Drive upload,
-client name in filename, folder links in Slack, and startup warmup handling.
+VAT Checker Slack Bot — with folder creation confirmation prompts
 """
 
 import os
@@ -8,20 +7,17 @@ import io
 import json
 import datetime
 import threading
-import time
 from flask import Flask, request, jsonify
 from slack_sdk import WebClient
 
 app = Flask(__name__)
 slack_client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
 
-# Primary Drive folder: NV - Customer Documents
-DRIVE_FOLDER_ID = "169XfIlnQfIg8ocQmeTkKeo9GKJrw-g-b"
-# Secondary Drive folder: second location
+DRIVE_FOLDER_ID   = "169XfIlnQfIg8ocQmeTkKeo9GKJrw-g-b"
 DRIVE_FOLDER_ID_2 = "1QL9T8XLnGuGMmHKU29xjeFHyHjhihwzK"
 VIES_CHECK_SUBFOLDER = "Vies Check"
 
-# Pending folder selections for interactive buttons
+# In-memory session store
 pending_uploads = {}
 
 
@@ -95,9 +91,8 @@ STATUS_COLORS = {
 }
 
 def make_filename(country_code, vat_number, company_name):
-    """Build a filename that includes the client name."""
-    safe_company = company_name.replace(" ", "_").replace("/", "-")[:40]
-    return f"VAT_{safe_company}_{country_code}{vat_number}_{datetime.date.today()}.pdf"
+    safe = company_name.replace(" ", "_").replace("/", "-")[:40]
+    return f"VAT_{safe}_{country_code}{vat_number}_{datetime.date.today()}.pdf"
 
 def generate_pdf_bytes(data):
     from reportlab.lib.pagesizes import A4
@@ -188,7 +183,6 @@ def get_drive_service():
 
 
 def get_all_subfolders(service, parent_id):
-    """Fetch all subfolders inside a given parent folder."""
     query = (
         f"'{parent_id}' in parents "
         f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -208,8 +202,11 @@ LEGAL_SUFFIXES = {
 }
 
 def clean_name(name):
+    # Strip leading numbers and dots (e.g. "105. ING" → "ING")
+    import re
+    name = re.sub(r'^\d+[\.\s]+', '', name)
     words = name.lower().replace("-", " ").replace("_", " ").split()
-    return [w for w in words if w not in LEGAL_SUFFIXES and len(w) > 2]
+    return [w for w in words if w not in LEGAL_SUFFIXES and len(w) >= 2]
 
 
 def score_match(company_name, folder_name):
@@ -245,12 +242,10 @@ def find_folder_candidates(all_folders, company_name):
 
 
 def get_folder_link(folder_id):
-    """Return a Google Drive folder link from a folder ID."""
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
 
 def find_or_create_subfolder(service, parent_id, subfolder_name):
-    """Find an existing subfolder by name, or create it if it doesn't exist."""
     query = (
         f"'{parent_id}' in parents and name = '{subfolder_name}' "
         f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -262,8 +257,6 @@ def find_or_create_subfolder(service, parent_id, subfolder_name):
     files = results.get("files", [])
     if files:
         return files[0]["id"]
-
-    # Create it
     folder = service.files().create(
         body={"name": subfolder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
         fields="id", supportsAllDrives=True
@@ -272,14 +265,11 @@ def find_or_create_subfolder(service, parent_id, subfolder_name):
 
 
 def upload_pdf_to_folder(service, pdf_bytes, filename, folder_id):
-    """Upload PDF to a specific folder. Returns the folder link (not file link)."""
     from googleapiclient.http import MediaIoBaseUpload
     media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf")
     service.files().create(
         body={"name": filename, "parents": [folder_id]},
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True
+        media_body=media, fields="id", supportsAllDrives=True
     ).execute()
     return get_folder_link(folder_id)
 
@@ -292,56 +282,6 @@ def create_customer_folder(service, parent_id, company_name):
     return folder["id"]
 
 
-def upload_to_both_drives(pdf_bytes, filename, company_name):
-    """
-    Upload PDF to both Drive locations.
-    Returns (folder1_link, folder2_link, folder1_name, folder2_name).
-    For location 2: finds client folder → finds/creates 'Vies Check' subfolder → uploads there.
-    """
-    service = get_drive_service()
-
-    # ── Location 1: NV - Customer Documents ──────────────────────────────────
-    all_folders_1 = get_all_subfolders(service, DRIVE_FOLDER_ID)
-    match_type_1, candidates_1 = find_folder_candidates(all_folders_1, company_name)
-
-    if match_type_1 in ("exact", "single_fuzzy"):
-        folder1_id = candidates_1[0]["id"]
-        folder1_name = candidates_1[0]["name"]
-        ambiguous_1 = False
-    elif match_type_1 == "ambiguous":
-        # Return candidates for user to pick — handled by caller
-        return None, None, None, None, candidates_1, []
-    else:
-        folder1_id = create_customer_folder(service, DRIVE_FOLDER_ID, company_name)
-        folder1_name = company_name
-        ambiguous_1 = False
-
-    folder1_link = upload_pdf_to_folder(service, pdf_bytes, filename, folder1_id)
-
-    # ── Location 2: Second folder → client folder → Vies Check ───────────────
-    all_folders_2 = get_all_subfolders(service, DRIVE_FOLDER_ID_2)
-    match_type_2, candidates_2 = find_folder_candidates(all_folders_2, company_name)
-
-    if match_type_2 in ("exact", "single_fuzzy"):
-        client_folder2_id = candidates_2[0]["id"]
-        folder2_name = candidates_2[0]["name"]
-    elif match_type_2 == "ambiguous":
-        # Best effort — pick highest scoring match for location 2
-        client_folder2_id = candidates_2[0]["id"]
-        folder2_name = candidates_2[0]["name"]
-    else:
-        client_folder2_id = create_customer_folder(service, DRIVE_FOLDER_ID_2, company_name)
-        folder2_name = company_name
-
-    # Find or create "Finance" subfolder inside client folder
-    finance_folder_id = find_or_create_subfolder(service, client_folder2_id, "Finance")
-    # Find or create "Vies Check" subfolder inside Finance folder
-    vies_check_folder_id = find_or_create_subfolder(service, finance_folder_id, VIES_CHECK_SUBFOLDER)
-    folder2_link = upload_pdf_to_folder(service, pdf_bytes, filename, vies_check_folder_id)
-
-    return folder1_link, folder2_link, folder1_name, folder2_name, [], []
-
-
 # ── Slack Helpers ─────────────────────────────────────────────────────────────
 
 STATUS_EMOJI = {"VALID": "✅", "INVALID": "❌", "UNAVAILABLE": "⚠️"}
@@ -350,28 +290,26 @@ STATUS_EMOJI = {"VALID": "✅", "INVALID": "❌", "UNAVAILABLE": "⚠️"}
 def post_drive_confirmation(channel_id, folder1_link, folder2_link, folder1_name, folder2_name):
     slack_client.chat_postMessage(
         channel=channel_id,
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"📁 *Saved to Google Drive:*\n"
-                        f"• <{folder1_link}|NV - Customer Documents → {folder1_name}>\n"
-                        f"• <{folder2_link}|{folder2_name} → Vies Check>"
-                    )
-                }
+        blocks=[{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"📁 *Saved to Google Drive:*\n"
+                    f"• <{folder1_link}|NV - Customer Documents → {folder1_name}>\n"
+                    f"• <{folder2_link}|{folder2_name} → Finance → Vies Check>"
+                )
             }
-        ]
+        }]
     )
 
 
 def ask_user_to_pick_folder(channel_id, pdf_bytes, filename, company_name, candidates):
-    """Post interactive buttons when folder match is ambiguous."""
+    """Post interactive buttons when folder match is ambiguous (location 1)."""
     import uuid
-
     pending_id = str(uuid.uuid4())[:8]
     pending_uploads[pending_id] = {
+        "type": "folder_pick",
         "pdf_bytes": pdf_bytes,
         "filename": filename,
         "company_name": company_name,
@@ -379,14 +317,15 @@ def ask_user_to_pick_folder(channel_id, pdf_bytes, filename, company_name, candi
         "candidates": {f["id"]: f["name"] for f in candidates},
     }
 
-    buttons = []
-    for folder in candidates[:4]:
-        buttons.append({
+    buttons = [
+        {
             "type": "button",
             "text": {"type": "plain_text", "text": folder["name"]},
             "value": json.dumps({"pending_id": pending_id, "folder_id": folder["id"]}),
             "action_id": f"folder_{folder['id'][:8]}"
-        })
+        }
+        for folder in candidates[:4]
+    ]
     buttons.append({
         "type": "button",
         "text": {"type": "plain_text", "text": f"➕ Create new: {company_name[:30]}"},
@@ -401,6 +340,60 @@ def ask_user_to_pick_folder(channel_id, pdf_bytes, filename, company_name, candi
             {"type": "section", "text": {"type": "mrkdwn",
                 "text": f"⚠️ *Multiple folders found for `{company_name}`*\nWhich folder should I save the PDF to?"}},
             {"type": "actions", "elements": buttons}
+        ]
+    )
+
+
+def ask_create_confirmation(channel_id, pdf_bytes, filename, company_name,
+                             folder1_id, folder1_name,
+                             need_create_loc1, need_create_loc2):
+    """
+    Ask user for permission to create missing client folder(s).
+    need_create_loc1: True if location 1 folder not found
+    need_create_loc2: True if location 2 folder not found
+    folder1_id / folder1_name: already resolved location 1 (if not need_create_loc1)
+    """
+    import uuid
+    pending_id = str(uuid.uuid4())[:8]
+    pending_uploads[pending_id] = {
+        "type": "create_confirm",
+        "pdf_bytes": pdf_bytes,
+        "filename": filename,
+        "company_name": company_name,
+        "channel_id": channel_id,
+        "folder1_id": folder1_id,
+        "folder1_name": folder1_name,
+        "need_create_loc1": need_create_loc1,
+        "need_create_loc2": need_create_loc2,
+    }
+
+    lines = [f"📂 I couldn't find a client folder for *{company_name}* in the following location(s):"]
+    if need_create_loc1:
+        lines.append("• NV - Customer Documents")
+    if need_create_loc2:
+        lines.append("• Second Drive location")
+    lines.append("\nShould I create new folder(s) and save the PDF there?")
+
+    slack_client.chat_postMessage(
+        channel=channel_id,
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+            {"type": "actions", "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Yes, create folder(s)"},
+                    "value": json.dumps({"pending_id": pending_id, "confirm": True}),
+                    "action_id": "create_yes",
+                    "style": "primary"
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌ No, skip"},
+                    "value": json.dumps({"pending_id": pending_id, "confirm": False}),
+                    "action_id": "create_no",
+                    "style": "danger"
+                }
+            ]}
         ]
     )
 
@@ -457,23 +450,52 @@ def process_vat(response_url, channel_id, vat_raw):
 
         # Upload PDF to Slack
         slack_client.files_upload_v2(
-            channel=channel_id,
-            filename=filename,
-            content=pdf_bytes,
+            channel=channel_id, filename=filename, content=pdf_bytes,
             title=f"VAT Verification — {company_name}",
             initial_comment=f"📄 PDF proof for {company_name} ({country_code}{vat_number})"
         )
 
-        # Upload to both Drive locations
+        # Resolve Drive folders
         try:
-            folder1_link, folder2_link, folder1_name, folder2_name, ambiguous_candidates, _ = \
-                upload_to_both_drives(pdf_bytes, filename, company_name)
+            service = get_drive_service()
 
-            if ambiguous_candidates:
-                # Ambiguous match on location 1 — ask user to pick
-                ask_user_to_pick_folder(channel_id, pdf_bytes, filename, company_name, ambiguous_candidates)
-            else:
-                post_drive_confirmation(channel_id, folder1_link, folder2_link, folder1_name, folder2_name)
+            # ── Location 1 ────────────────────────────────────────────────────
+            all_folders_1 = get_all_subfolders(service, DRIVE_FOLDER_ID)
+            match_type_1, candidates_1 = find_folder_candidates(all_folders_1, company_name)
+
+            if match_type_1 == "ambiguous":
+                ask_user_to_pick_folder(channel_id, pdf_bytes, filename, company_name, candidates_1)
+                return
+
+            folder1_id   = candidates_1[0]["id"]   if match_type_1 in ("exact", "single_fuzzy") else None
+            folder1_name = candidates_1[0]["name"]  if match_type_1 in ("exact", "single_fuzzy") else company_name
+            need_create_loc1 = (match_type_1 == "none")
+
+            # ── Location 2 ────────────────────────────────────────────────────
+            all_folders_2 = get_all_subfolders(service, DRIVE_FOLDER_ID_2)
+            match_type_2, candidates_2 = find_folder_candidates(all_folders_2, company_name)
+
+            folder2_id   = candidates_2[0]["id"]   if match_type_2 in ("exact", "single_fuzzy", "ambiguous") else None
+            need_create_loc2 = (match_type_2 == "none")
+
+            # ── Ask for creation permission if any folder is missing ──────────
+            if need_create_loc1 or need_create_loc2:
+                ask_create_confirmation(
+                    channel_id, pdf_bytes, filename, company_name,
+                    folder1_id, folder1_name,
+                    need_create_loc1, need_create_loc2
+                )
+                return
+
+            # ── Both found — upload directly ──────────────────────────────────
+            folder1_link = upload_pdf_to_folder(service, pdf_bytes, filename, folder1_id)
+
+            finance_id   = find_or_create_subfolder(service, folder2_id, "Finance")
+            vies_id      = find_or_create_subfolder(service, finance_id, VIES_CHECK_SUBFOLDER)
+            folder2_link = upload_pdf_to_folder(service, pdf_bytes, filename, vies_id)
+            folder2_name = candidates_2[0]["name"]
+
+            post_drive_confirmation(channel_id, folder1_link, folder2_link, folder1_name, folder2_name)
 
         except Exception as e:
             slack_client.chat_postMessage(channel=channel_id, text=f"⚠️ Drive upload failed: {e}")
@@ -491,7 +513,7 @@ def health():
 
 @app.route("/slack/vat", methods=["POST"])
 def slack_vat():
-    vat_raw = request.form.get("text", "").strip()
+    vat_raw    = request.form.get("text", "").strip()
     response_url = request.form.get("response_url")
     channel_id = request.form.get("channel_id")
 
@@ -501,25 +523,19 @@ def slack_vat():
             "text": "Usage: `/vat SE663000013801`\nPaste any EU VAT number after the command."
         })
 
-    # Respond immediately to prevent Slack's 3-second timeout / operation_timeout error
     threading.Thread(target=process_vat, args=(response_url, channel_id, vat_raw)).start()
-    return jsonify({
-        "response_type": "ephemeral",
-        "text": "⚙️ Agent is starting up, please wait..."
-    })
+    return jsonify({"response_type": "ephemeral", "text": "⚙️ Agent is starting up, please wait..."})
 
 
 @app.route("/slack/actions", methods=["POST"])
 def slack_actions():
-    """Handle interactive button clicks for folder selection."""
-    payload = json.loads(request.form.get("payload", "{}"))
-    actions = payload.get("actions", [])
+    payload    = json.loads(request.form.get("payload", "{}"))
+    actions    = payload.get("actions", [])
     channel_id = payload.get("channel", {}).get("id")
 
     for action in actions:
-        value = json.loads(action.get("value", "{}"))
+        value      = json.loads(action.get("value", "{}"))
         pending_id = value.get("pending_id")
-        chosen_folder_id = value.get("folder_id")
 
         upload_data = pending_uploads.pop(pending_id, None)
         if not upload_data:
@@ -527,41 +543,83 @@ def slack_actions():
                 text="⚠️ Session expired. Please run the /vat check again.")
             return jsonify({})
 
-        pdf_bytes = upload_data["pdf_bytes"]
-        filename = upload_data["filename"]
+        pdf_bytes    = upload_data["pdf_bytes"]
+        filename     = upload_data["filename"]
         company_name = upload_data["company_name"]
+        session_type = upload_data.get("type", "folder_pick")
 
         try:
             service = get_drive_service()
 
-            # Location 1 — chosen folder
-            if chosen_folder_id == "NEW":
-                folder1_id = create_customer_folder(service, DRIVE_FOLDER_ID, company_name)
-                folder1_name = company_name
-            else:
-                folder1_id = chosen_folder_id
-                folder1_name = upload_data["candidates"].get(chosen_folder_id, company_name)
+            # ── Folder pick (ambiguous match) ─────────────────────────────────
+            if session_type == "folder_pick":
+                chosen_folder_id = value.get("folder_id")
 
-            folder1_link = upload_pdf_to_folder(service, pdf_bytes, filename, folder1_id)
+                if chosen_folder_id == "NEW":
+                    folder1_id   = create_customer_folder(service, DRIVE_FOLDER_ID, company_name)
+                    folder1_name = company_name
+                else:
+                    folder1_id   = chosen_folder_id
+                    folder1_name = upload_data["candidates"].get(chosen_folder_id, company_name)
 
-            # Location 2 — fuzzy match then Vies Check subfolder
-            all_folders_2 = get_all_subfolders(service, DRIVE_FOLDER_ID_2)
-            match_type_2, candidates_2 = find_folder_candidates(all_folders_2, company_name)
+                folder1_link = upload_pdf_to_folder(service, pdf_bytes, filename, folder1_id)
 
-            if match_type_2 in ("exact", "single_fuzzy", "ambiguous"):
-                client_folder2_id = candidates_2[0]["id"]
-                folder2_name = candidates_2[0]["name"]
-            else:
-                client_folder2_id = create_customer_folder(service, DRIVE_FOLDER_ID_2, company_name)
-                folder2_name = company_name
+                all_folders_2  = get_all_subfolders(service, DRIVE_FOLDER_ID_2)
+                match_type_2, candidates_2 = find_folder_candidates(all_folders_2, company_name)
 
-            # Find or create "Finance" subfolder inside client folder
-            finance_folder_id = find_or_create_subfolder(service, client_folder2_id, "Finance")
-            # Find or create "Vies Check" subfolder inside Finance folder
-            vies_check_folder_id = find_or_create_subfolder(service, finance_folder_id, VIES_CHECK_SUBFOLDER)
-            folder2_link = upload_pdf_to_folder(service, pdf_bytes, filename, vies_check_folder_id)
+                if match_type_2 in ("exact", "single_fuzzy", "ambiguous"):
+                    folder2_id   = candidates_2[0]["id"]
+                    folder2_name = candidates_2[0]["name"]
+                    finance_id   = find_or_create_subfolder(service, folder2_id, "Finance")
+                    vies_id      = find_or_create_subfolder(service, finance_id, VIES_CHECK_SUBFOLDER)
+                    folder2_link = upload_pdf_to_folder(service, pdf_bytes, filename, vies_id)
+                    post_drive_confirmation(channel_id, folder1_link, folder2_link, folder1_name, folder2_name)
+                else:
+                    # Location 2 also missing — ask for creation confirmation
+                    ask_create_confirmation(
+                        channel_id, pdf_bytes, filename, company_name,
+                        folder1_id, folder1_name,
+                        need_create_loc1=False, need_create_loc2=True
+                    )
+                    # Post loc1 confirmation immediately
+                    slack_client.chat_postMessage(channel=channel_id,
+                        text=f"✅ PDF saved to NV - Customer Documents → *{folder1_name}*\n<{get_folder_link(folder1_id)}|Open folder>")
 
-            post_drive_confirmation(channel_id, folder1_link, folder2_link, folder1_name, folder2_name)
+            # ── Create confirmation (yes/no) ───────────────────────────────────
+            elif session_type == "create_confirm":
+                confirm          = value.get("confirm", False)
+                folder1_id       = upload_data["folder1_id"]
+                folder1_name     = upload_data["folder1_name"]
+                need_create_loc1 = upload_data["need_create_loc1"]
+                need_create_loc2 = upload_data["need_create_loc2"]
+
+                if not confirm:
+                    slack_client.chat_postMessage(channel=channel_id,
+                        text=f"⏭️ Skipped — no new folders created for *{company_name}*.")
+                    return jsonify({})
+
+                # Create loc1 if needed
+                if need_create_loc1:
+                    folder1_id   = create_customer_folder(service, DRIVE_FOLDER_ID, company_name)
+                    folder1_name = company_name
+
+                folder1_link = upload_pdf_to_folder(service, pdf_bytes, filename, folder1_id)
+
+                # Create loc2 if needed
+                if need_create_loc2:
+                    folder2_id   = create_customer_folder(service, DRIVE_FOLDER_ID_2, company_name)
+                    folder2_name = company_name
+                else:
+                    all_folders_2 = get_all_subfolders(service, DRIVE_FOLDER_ID_2)
+                    _, candidates_2 = find_folder_candidates(all_folders_2, company_name)
+                    folder2_id   = candidates_2[0]["id"]
+                    folder2_name = candidates_2[0]["name"]
+
+                finance_id   = find_or_create_subfolder(service, folder2_id, "Finance")
+                vies_id      = find_or_create_subfolder(service, finance_id, VIES_CHECK_SUBFOLDER)
+                folder2_link = upload_pdf_to_folder(service, pdf_bytes, filename, vies_id)
+
+                post_drive_confirmation(channel_id, folder1_link, folder2_link, folder1_name, folder2_name)
 
         except Exception as e:
             slack_client.chat_postMessage(channel=channel_id, text=f"⚠️ Drive upload failed: {e}")
